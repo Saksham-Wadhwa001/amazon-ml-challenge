@@ -1,0 +1,23 @@
+# Amazon ML - Business Entity Resolution :: dependencies
+# Install into the `ml_challenge` conda env. After a successful run, freeze exact
+# versions for the final submission package:  pip freeze > requirements.txt
+
+# --- Data / preprocessing (preprocess.py) ---
+polars>=1.37
+pyarrow>=15.0
+
+# --- ER pipeline, CPU side (entity_resolution.py) ---
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+lightgbm>=4.3
+rapidfuzz>=3.9
+joblib>=1.3
+
+# --- Pretrained models, GPU side (er_models.py) ---
+# Qwen3 requires transformers >= 4.51; Qwen3-Embedding works via sentence-transformers >= 5.0
+torch>=2.4
+transformers>=4.51
+sentence-transformers>=5.0
+accelerate>=0.30

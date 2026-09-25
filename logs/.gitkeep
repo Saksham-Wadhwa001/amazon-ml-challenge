@@ -1,0 +1,2 @@
+# Keep this directory in version control.
+# Slurm writes preprocess_<jobid>.out / .err here (see slurm_jobs/job_preprocess.sh).

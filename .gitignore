@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+env/
+venv/
+
+# Input data & pipeline artifacts (kept out of version control)
+data/
+*.parquet
+
+# Slurm run logs (keep the directory, ignore the generated logs)
+logs/*.out
+logs/*.err
+!logs/.gitkeep

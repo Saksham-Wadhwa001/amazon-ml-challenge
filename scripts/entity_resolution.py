@@ -267,6 +267,54 @@ def blocked_topk(q_ids, Q, q_ctry, t_ids, T, t_ctry, k, q_chunk=256, t_chunk=50_
     return result
 
 
+def sparse_topk_blocking(q_ids, Qs, q_ctry, t_ids, Ts, t_ctry, k,
+                         q_chunk=1000, tag=""):
+    """
+    Scalable per-country top-k blocking via SPARSE cosine (inverted-index join).
+
+    Qs, Ts are L2-normalized *sparse* word-level (df-capped) TF-IDF matrices, so
+    ``Qs[block] @ Ts.T`` is sparse: only records sharing a distinctive token are
+    ever compared. No all-pairs loop and no dense (queries x targets) matrix, so
+    this stays tractable at 10M+ records where brute-force blocking cannot.
+    Emits progress so the run never looks "stuck".
+    """
+    result: dict[str, set[str]] = defaultdict(set)
+    t_ids = np.asarray(t_ids)
+    t_groups = _country_groups(t_ctry)
+    q_groups = _country_groups(q_ctry)
+    total_q = sum(len(v) for v in q_groups.values())
+    done, next_report, t0 = 0, 0, time.time()
+
+    for country, q_idx in q_groups.items():
+        t_idx = t_groups.get(country)
+        if t_idx is None or len(t_idx) == 0:
+            done += len(q_idx)
+            continue
+        Tt = Ts[t_idx].T.tocsr()                 # V x n_t (sparse)
+        tid_c = t_ids[t_idx]
+        for s in range(0, len(q_idx), q_chunk):
+            qb = q_idx[s:s + q_chunk]
+            sims = (Qs[qb] @ Tt).tocsr()         # (B x n_t) sparse
+            indptr, data, indices = sims.indptr, sims.data, sims.indices
+            for r in range(len(qb)):
+                a, b = indptr[r], indptr[r + 1]
+                if b == a:
+                    continue
+                d = data[a:b]
+                cols = indices[a:b]
+                top = np.argpartition(-d, k - 1)[:k] if d.size > k else np.arange(d.size)
+                add = result[q_ids[qb[r]]].add
+                for j in top:
+                    add(tid_c[cols[j]])
+            done += len(qb)
+            if tag and done >= next_report:
+                rate = done / max(time.time() - t0, 1e-6)
+                log(f"    [{tag}] blocked {done:,}/{total_q:,} "
+                    f"({100.0 * done / max(total_q, 1):.0f}%)  ~{rate:,.0f} q/s")
+                next_report += 100_000
+    return result
+
+
 def pincode_candidates(q, t) -> dict[str, set[str]]:
     """Exact (country, pincode) matches -- a strong structured blocking key."""
     buckets: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -429,11 +477,12 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
         s1 = s1[s1["entity_id"].isin(s1_filter)].reset_index(drop=True)
     log(f"[{split}] S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}  targets={len(tgt):,}")
 
-    # TF-IDF fitted transductively on this split's corpus (covers unseen langs).
-    name_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4),
-                               min_df=args.min_df, sublinear_tf=True)
-    comb_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
-                               min_df=args.min_df, sublinear_tf=True)
+    # Word-level, df-capped TF-IDF -> sparse & distinctive, so blocking is an
+    # inverted-index join (only shared-token records compared). max_df drops
+    # ultra-common words (e.g. "road") so posting lists stay short; min_df drops
+    # hapax/typo-unique tokens. char-level typos are handled later by RapidFuzz.
+    name_vec = TfidfVectorizer(min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
+    comb_vec = TfidfVectorizer(min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
     name_vec.fit(pd.concat([s1["name"], tgt["name"]], ignore_index=True))
     comb_vec.fit(pd.concat([s1["combined"], tgt["combined"]], ignore_index=True))
 
@@ -455,20 +504,22 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
         tgt_emb = _cached_embed(emb_model, tgt["combined"].tolist(), tgt["entity_id"].tolist(),
                                 cache_dir, f"{split}_tgt", False, use_cache)
 
-    log(f"[{split}] generating candidates (tfidf k={args.k_tfidf}, emb k={args.k_emb}) ...")
-    cand_name = blocked_topk(s1["entity_id"].to_numpy(), s1_name_tfidf, s1["country"].to_numpy(),
-                             tgt["entity_id"].to_numpy(), tgt_name_tfidf, tgt["country"].to_numpy(),
-                             args.k_tfidf)
-    cand_comb = blocked_topk(s1["entity_id"].to_numpy(), s1_comb_tfidf, s1["country"].to_numpy(),
-                             tgt["entity_id"].to_numpy(), tgt_comb_tfidf, tgt["country"].to_numpy(),
-                             args.k_tfidf)
-    parts = [cand_name, cand_comb]
+    log(f"[{split}] blocking (word-tfidf top-k={args.k_tfidf}, df_cap={args.max_df}) ...")
+    s1_ids_a = s1["entity_id"].to_numpy(); s1_ctry_a = s1["country"].to_numpy()
+    tgt_ids_a = tgt["entity_id"].to_numpy(); tgt_ctry_a = tgt["country"].to_numpy()
+    cand_name = sparse_topk_blocking(s1_ids_a, s1_name_tfidf, s1_ctry_a,
+                                     tgt_ids_a, tgt_name_tfidf, tgt_ctry_a,
+                                     args.k_tfidf, tag=f"{split}:name")
+    cand_comb = sparse_topk_blocking(s1_ids_a, s1_comb_tfidf, s1_ctry_a,
+                                     tgt_ids_a, tgt_comb_tfidf, tgt_ctry_a,
+                                     args.k_tfidf, tag=f"{split}:comb")
+    parts = [cand_name, cand_comb, pincode_candidates(s1, tgt)]
     if args.use_emb:
-        cand_emb = blocked_topk(s1["entity_id"].to_numpy(), s1_emb, s1["country"].to_numpy(),
-                                tgt["entity_id"].to_numpy(), tgt_emb, tgt["country"].to_numpy(),
-                                args.k_emb)
+        # Dense embedding blocking (only viable on GPU / small data); off by
+        # default. Uses the memory-bounded blocked_topk.
+        cand_emb = blocked_topk(s1_ids_a, s1_emb, s1_ctry_a,
+                                tgt_ids_a, tgt_emb, tgt_ctry_a, args.k_emb)
         parts.append(cand_emb)
-    parts.append(pincode_candidates(s1, tgt))
     candidates = merge_candidates(*parts)
 
     n_pairs = sum(len(v) for v in candidates.values())
@@ -835,8 +886,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rerank-model", default="Qwen/Qwen3-Reranker-8B")
     p.add_argument("--no-embeddings", action="store_true", help="Skip the embedding stage.")
     p.add_argument("--no-reranker", action="store_true", help="Skip the reranker feature.")
-    p.add_argument("--k-tfidf", type=int, default=50)
+    p.add_argument("--k-tfidf", type=int, default=20,
+                   help="Top-k candidates per blocking pass (smaller = leaner candidate set).")
     p.add_argument("--k-emb", type=int, default=50)
+    p.add_argument("--max-df", type=int, default=50_000,
+                   help="Drop tokens appearing in more than this many documents "
+                        "(keeps blocking posting lists short; absolute count).")
     p.add_argument("--rerank-batch", type=int, default=16)
     p.add_argument("--min-df", type=int, default=2)
     p.add_argument("--val-frac", type=float, default=0.2)

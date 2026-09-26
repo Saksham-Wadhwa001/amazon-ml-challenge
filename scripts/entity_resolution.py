@@ -394,13 +394,19 @@ def _save_candidates(cache_dir: Path, split: str, candidates: dict[str, set[str]
 
 
 def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
-                   args) -> dict:
-    """Load a split, fit TF-IDF, embed, and build the candidate set + vectors."""
+                   args, s1_filter: set[str] | None = None) -> dict:
+    """Load a split, fit TF-IDF, embed, and build the candidate set + vectors.
+
+    If ``s1_filter`` is given, only those Source-1 entities are processed as
+    queries (used for Kaggle-style batching); the S2/S3 target pool is unchanged.
+    """
     log(f"[{split}] loading sources ...")
     s1 = prepare(load_source(processed_dir, split, 1))
     s2 = prepare(load_source(processed_dir, split, 2))
     s3 = prepare(load_source(processed_dir, split, 3))
     tgt = pd.concat([s2, s3], ignore_index=True)
+    if s1_filter is not None:
+        s1 = s1[s1["entity_id"].isin(s1_filter)].reset_index(drop=True)
     log(f"[{split}] S1={len(s1):,}  S2={len(s2):,}  S3={len(s3):,}  targets={len(tgt):,}")
 
     # TF-IDF fitted transductively on this split's corpus (covers unseen langs).
@@ -421,8 +427,11 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
         log(f"[{split}] embedding {len(s1):,} queries + {len(tgt):,} targets ...")
         cache_dir = Path(args.artifacts_dir)
         use_cache = not args.no_cache
+        # Targets (S2+S3) are embedded once and reused across every shard; the
+        # per-shard S1 slice is small, so it is embedded fresh (not cached).
+        s1_cache = use_cache and s1_filter is None
         s1_emb = _cached_embed(emb_model, s1["combined"].tolist(), s1["entity_id"].tolist(),
-                               cache_dir, f"{split}_s1", True, use_cache)
+                               cache_dir, f"{split}_s1", True, s1_cache)
         tgt_emb = _cached_embed(emb_model, tgt["combined"].tolist(), tgt["entity_id"].tolist(),
                                 cache_dir, f"{split}_tgt", False, use_cache)
 
@@ -445,7 +454,7 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
     n_pairs = sum(len(v) for v in candidates.values())
     log(f"[{split}] candidates: {n_pairs:,} pairs over {len(candidates):,} S1 entities "
         f"(avg {n_pairs / max(len(s1), 1):.1f}/entity)")
-    if not args.no_cache:
+    if not args.no_cache and s1_filter is None:
         _save_candidates(Path(args.artifacts_dir), split, candidates)
 
     return dict(
@@ -643,59 +652,141 @@ def _maybe_reranker(args) -> Reranker | None:
     return rr
 
 
+def _read_ids(path: Path) -> list[str]:
+    return pd.read_parquet(path, columns=["entity_id"])["entity_id"].astype(str).tolist()
+
+
+def _ensure_all(df: pd.DataFrame, all_ids: list[str], col: str) -> pd.DataFrame:
+    """Keep only known S1 ids, add missing ones as empty rows, order by all_ids."""
+    have = set(df["source1_entity_id"])
+    extra = [{"source1_entity_id": s, col: ""} for s in all_ids if s not in have]
+    if extra:
+        df = pd.concat([df, pd.DataFrame(extra)], ignore_index=True)
+    order = {s: i for i, s in enumerate(all_ids)}
+    df = df[df["source1_entity_id"].isin(order)].copy()
+    df["__o"] = df["source1_entity_id"].map(order)
+    return df.sort_values("__o")[["source1_entity_id", col]].reset_index(drop=True)
+
+
+def merge_parts(output_dir: Path, processed_dir: Path) -> int:
+    """Concatenate per-shard part files into the final submission TSVs."""
+    parts = output_dir / "parts"
+    m_files = sorted(parts.glob("matching_part_*.tsv"))
+    c_files = sorted(parts.glob("candidate_part_*.tsv"))
+    if not m_files:
+        log(f"[merge] no matching_part_*.tsv in {parts}"); return 1
+    log(f"[merge] combining {len(m_files)} matching + {len(c_files)} candidate part(s)")
+
+    def _combine(files, col):
+        if not files:
+            return pd.DataFrame(columns=["source1_entity_id", col])
+        df = pd.concat([pd.read_csv(f, sep="\t", dtype=str) for f in files], ignore_index=True)
+        return df.fillna("").drop_duplicates("source1_entity_id")
+
+    test_s1 = _read_ids(processed_dir / "clean_test_source1.parquet")
+    m = _ensure_all(_combine(m_files, "matched_entity_ids"), test_s1, "matched_entity_ids")
+    c = _ensure_all(_combine(c_files, "candidate_entity_ids"), test_s1, "candidate_entity_ids")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    m.to_csv(output_dir / "matching_results.tsv", sep="\t", index=False)
+    c.to_csv(output_dir / "candidate_pairs.tsv", sep="\t", index=False)
+    log(f"[merge] wrote final outputs ({len(m):,} rows)")
+
+    matching = {r["source1_entity_id"]: [x for x in r["matched_entity_ids"].split(",") if x]
+                for _, r in m.iterrows()}
+    cand = {r["source1_entity_id"]: [x for x in r["candidate_entity_ids"].split(",") if x]
+            for _, r in c.iterrows()}
+    valid_targets = (set(_read_ids(processed_dir / "clean_test_source2.parquet"))
+                     | set(_read_ids(processed_dir / "clean_test_source3.parquet")))
+    validate_submission(matching, cand, test_s1, valid_targets)
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     args.use_emb = not args.no_embeddings
     args._reranker_cache = None
     processed_dir = Path(args.processed_dir)
     output_dir = Path(args.output_dir)
-
-    log("Amazon ML - Business Entity Resolution :: matching pipeline")
-    log(f"emb_model={'(disabled)' if not args.use_emb else args.emb_model} "
-        f"rerank={'(off)' if args.no_reranker else args.rerank_model} "
-        f"rapidfuzz={_HAVE_RAPIDFUZZ}")
-
-    emb_model = EmbeddingModel(model_name=args.emb_model) if args.use_emb else None
     art = Path(args.artifacts_dir)
     model_path, meta_path = art / "matcher_lgbm.joblib", art / "matcher_meta.json"
 
-    # -------- TRAIN (or resume from a cached matcher) ------------------------
-    if args.use_cached_model and model_path.exists() and meta_path.exists():
+    log("Amazon ML - Business Entity Resolution :: matching pipeline")
+    log(f"stage={args.stage} shards={args.num_shards} shard_id={args.shard_id} "
+        f"emb={'(off)' if not args.use_emb else args.emb_model} "
+        f"rerank={'(off)' if args.no_reranker else args.rerank_model}")
+
+    # ---------------- MERGE ----------------
+    if args.stage == "merge":
+        return merge_parts(output_dir, processed_dir)
+
+    emb_model = EmbeddingModel(model_name=args.emb_model) if args.use_emb else None
+
+    # ---------------- TRAIN (or resume from cached matcher) ----------------
+    if args.stage in ("all", "train"):
+        if args.use_cached_model and model_path.exists() and meta_path.exists():
+            clf = joblib.load(model_path)
+            meta = json.loads(meta_path.read_text())
+            threshold = float(meta["threshold"]); feature_cols = meta["feature_cols"]
+            log("[resume] loaded cached matcher; skipping training.")
+        else:
+            gt = load_ground_truth(Path(args.ground_truth))
+            log(f"ground truth: {len(gt):,} S1 entities, "
+                f"{sum(len(v) for v in gt.values()):,} match links")
+            train_data = generate_split(processed_dir, "train", emb_model, args)
+            clf, threshold, feature_cols = train_matcher(train_data, gt, args)
+        if args.stage == "train":
+            log("[train] complete -- model saved. Next: --stage predict")
+            return 0
+    else:  # --stage predict: matcher must already be trained + cached
+        if not (model_path.exists() and meta_path.exists()):
+            log(f"[ERROR] no cached matcher in {art}. Run '--stage train' first.")
+            return 1
         clf = joblib.load(model_path)
         meta = json.loads(meta_path.read_text())
-        threshold = float(meta["threshold"])
-        feature_cols = meta["feature_cols"]
-        log(f"[resume] loaded cached matcher (threshold={threshold:.2f}, "
-            f"val F0.5={meta.get('val_entity_macro', {}).get('f_beta', float('nan')):.4f}); "
-            f"skipping training.")
-    else:
-        gt = load_ground_truth(Path(args.ground_truth))
-        log(f"ground truth: {len(gt):,} S1 entities, "
-            f"{sum(len(v) for v in gt.values()):,} match links")
-        train_data = generate_split(processed_dir, "train", emb_model, args)
-        clf, threshold, feature_cols = train_matcher(train_data, gt, args)
+        threshold = float(meta["threshold"]); feature_cols = meta["feature_cols"]
+        log(f"[predict] loaded matcher (threshold={threshold:.2f})")
 
-    # -------- TEST: candidates -> predict -> write outputs -------------------
-    test_data = generate_split(processed_dir, "test", emb_model, args)
-    test_s1_ids = list(test_data["s1"]["entity_id"].to_numpy())
+    # ---------------- PREDICT (optionally sharded) ----------------
+    test_s1_all = sorted(_read_ids(processed_dir / "clean_test_source1.parquet"))
+    sharded = args.num_shards > 1
+    if sharded:
+        if not (0 <= args.shard_id < args.num_shards):
+            log(f"[ERROR] --shard-id must be in [0, {args.num_shards})."); return 1
+        shard_ids = list(np.array_split(np.array(test_s1_all), args.num_shards)[args.shard_id])
+        parts_dir = output_dir / "parts"
+        m_part = parts_dir / f"matching_part_{args.shard_id:04d}.tsv"
+        c_part = parts_dir / f"candidate_part_{args.shard_id:04d}.tsv"
+        if m_part.exists() and c_part.exists() and not args.force:
+            log(f"[predict] shard {args.shard_id} already done -> skip (--force to redo).")
+            return 0
+        log(f"[predict] shard {args.shard_id + 1}/{args.num_shards}: "
+            f"{len(shard_ids):,} of {len(test_s1_all):,} S1 entities")
+        s1_filter: set[str] | None = set(shard_ids)
+    else:
+        shard_ids, s1_filter = test_s1_all, None
+
+    test_data = generate_split(processed_dir, "test", emb_model, args, s1_filter=s1_filter)
+    s1_ids = list(test_data["s1"]["entity_id"].to_numpy())
     candidates_out = {q: sorted(v) for q, v in test_data["candidates"].items()}
     matches_out = predict_split(test_data, clf, threshold, feature_cols, args)
+    candidates_out = {s1: candidates_out.get(s1, []) for s1 in s1_ids}
+    matches_out = {s1: matches_out.get(s1, []) for s1 in s1_ids}
 
-    # Every test S1 entity must appear exactly once (singletons -> empty list).
-    candidates_out = {s1: candidates_out.get(s1, []) for s1 in test_s1_ids}
-    matches_out = {s1: matches_out.get(s1, []) for s1 in test_s1_ids}
+    if sharded:
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        write_submission(c_part, s1_ids, candidates_out, "candidate_entity_ids")
+        write_submission(m_part, s1_ids, matches_out, "matched_entity_ids")
+        log(f"[predict] shard {args.shard_id} done. After all shards run: --stage merge")
+        return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_submission(output_dir / "candidate_pairs.tsv", test_s1_ids,
-                     candidates_out, "candidate_entity_ids")
-    write_submission(output_dir / "matching_results.tsv", test_s1_ids,
-                     matches_out, "matched_entity_ids")
-
+    write_submission(output_dir / "candidate_pairs.tsv", s1_ids, candidates_out, "candidate_entity_ids")
+    write_submission(output_dir / "matching_results.tsv", s1_ids, matches_out, "matched_entity_ids")
     valid_targets = set(test_data["tgt"]["entity_id"].to_numpy())
-    validate_submission(matches_out, candidates_out, test_s1_ids, valid_targets)
-
-    n_matched = sum(1 for s1 in test_s1_ids if matches_out.get(s1))
-    log(f"[done] {n_matched:,}/{len(test_s1_ids):,} test S1 entities received >=1 match "
+    validate_submission(matches_out, candidates_out, s1_ids, valid_targets)
+    n_matched = sum(1 for s1 in s1_ids if matches_out.get(s1))
+    log(f"[done] {n_matched:,}/{len(s1_ids):,} test S1 entities matched "
         f"(threshold={threshold:.2f})")
     return 0
 
@@ -711,6 +802,14 @@ def parse_args() -> argparse.Namespace:
                    help="Disable all checkpointing (embeddings / candidates / model).")
     p.add_argument("--use-cached-model", action="store_true",
                    help="Load a previously trained matcher and skip training.")
+    p.add_argument("--stage", choices=["all", "train", "predict", "merge"], default="all",
+                   help="all = train+predict; split into stages for Kaggle-style batching.")
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="Split test Source-1 entities into N batches for --stage predict.")
+    p.add_argument("--shard-id", type=int, default=0,
+                   help="Which 0-based batch to run (used with --num-shards).")
+    p.add_argument("--force", action="store_true",
+                   help="Recompute a shard even if its part files already exist.")
     p.add_argument("--emb-model", default="Qwen/Qwen3-Embedding-8B",
                    help="HF model id, or 'hashing' to force the CPU fallback.")
     p.add_argument("--rerank-model", default="Qwen/Qwen3-Reranker-8B")

@@ -213,13 +213,18 @@ def _country_groups(countries: np.ndarray) -> dict[str, np.ndarray]:
     return {c: np.asarray(ix, dtype=np.int64) for c, ix in groups.items()}
 
 
-def blocked_topk(q_ids, Q, q_ctry, t_ids, T, t_ctry, k, q_chunk=512):
+def blocked_topk(q_ids, Q, q_ctry, t_ids, T, t_ctry, k, q_chunk=256, t_chunk=50_000):
     """
     Top-k most similar targets for each query, restricted to the same country.
 
     Q, T may be scipy-sparse (TF-IDF) or dense numpy (embeddings); both assumed
     L2-normalized so a dot product is cosine similarity. Returns
     {q_id: set(t_id)} keeping only strictly-positive similarities.
+
+    Memory-bounded: similarities are computed in ``q_chunk x t_chunk`` blocks
+    with a running top-k, so the full (queries x targets) matrix is NEVER
+    materialized. Peak temporary memory ~= q_chunk * t_chunk floats regardless
+    of how many records a country has (this is what avoids the Kaggle OOM).
     """
     is_sparse = sparse.issparse(Q)
     result: dict[str, set[str]] = defaultdict(set)
@@ -231,19 +236,34 @@ def blocked_topk(q_ids, Q, q_ctry, t_ids, T, t_ctry, k, q_chunk=512):
         if t_idx is None or len(t_idx) == 0:
             continue
         T_c = T[t_idx]
-        kk = int(min(k, len(t_idx)))
-        for start in range(0, len(q_idx), q_chunk):
-            qb = q_idx[start:start + q_chunk]
-            sims = Q[qb] @ T_c.T
-            sims = sims.toarray() if is_sparse else np.asarray(sims)
-            # indices of the top-kk columns per row (unordered is fine)
-            part = np.argpartition(-sims, kk - 1, axis=1)[:, :kk] if kk > 1 \
-                else np.argmax(sims, axis=1, keepdims=True)
-            for r, qi in enumerate(qb):
-                row = sims[r]
-                for col in part[r]:
-                    if row[col] > 0.0:
-                        result[q_ids[qi]].add(t_ids[t_idx[col]])
+        n_t = len(t_idx)
+        kk = int(min(k, n_t))
+        for qs in range(0, len(q_idx), q_chunk):
+            qb = q_idx[qs:qs + q_chunk]
+            Qb = Q[qb]
+            B = len(qb)
+            best_val = np.full((B, kk), -1.0, dtype=np.float32)
+            best_col = np.full((B, kk), -1, dtype=np.int64)
+            for ts in range(0, n_t, t_chunk):
+                te = min(ts + t_chunk, n_t)
+                block = Qb @ T_c[ts:te].T                       # small B x (te-ts)
+                block = block.toarray() if is_sparse else np.asarray(block)
+                block = block.astype(np.float32, copy=False)
+                # merge this block with the running top-k and re-select top-k
+                cand_val = np.concatenate([best_val, block], axis=1)
+                idx_block = np.broadcast_to(np.arange(ts, te), (B, te - ts))
+                cand_col = np.concatenate([best_col, idx_block], axis=1)
+                kk2 = min(kk, cand_val.shape[1])
+                part = np.argpartition(-cand_val, kk2 - 1, axis=1)[:, :kk2]
+                rows = np.arange(B)[:, None]
+                best_val = cand_val[rows, part]
+                best_col = cand_col[rows, part]
+            for r in range(B):
+                qid = q_ids[qb[r]]
+                for j in range(kk):
+                    col = best_col[r, j]
+                    if col >= 0 and best_val[r, j] > 0.0:
+                        result[qid].add(t_ids[t_idx[int(col)]])
     return result
 
 

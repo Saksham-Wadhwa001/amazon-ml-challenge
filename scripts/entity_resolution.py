@@ -356,6 +356,7 @@ def build_pairs_and_features(
     s1_name_tfidf, tgt_name_tfidf,
     s1_comb_tfidf, tgt_comb_tfidf,
     s1_char_tfidf, tgt_char_tfidf,
+    s1_achar_tfidf, tgt_achar_tfidf,
     s1_emb, tgt_emb,
     reranker: Reranker | None,
     use_emb: bool,
@@ -384,6 +385,7 @@ def build_pairs_and_features(
     feats["name_tfidf_cos"] = _row_cos_sparse(s1_name_tfidf[qi], tgt_name_tfidf[ti])
     feats["comb_tfidf_cos"] = _row_cos_sparse(s1_comb_tfidf[qi], tgt_comb_tfidf[ti])
     feats["name_char_cos"] = _row_cos_sparse(s1_char_tfidf[qi], tgt_char_tfidf[ti])
+    feats["addr_char_cos"] = _row_cos_sparse(s1_achar_tfidf[qi], tgt_achar_tfidf[ti])
     if use_emb and s1_emb is not None and tgt_emb is not None:
         feats["emb_cos"] = np.sum(s1_emb[qi] * tgt_emb[ti], axis=1)
 
@@ -417,6 +419,64 @@ def build_pairs_and_features(
         return len(sa & sb) / len(sa | sb)
 
     feats["name_jaccard"] = np.array([_jacc(qn[a], tn[b]) for a, b in zip(qi, ti)])
+
+    # --- Competition / ranking features -------------------------------------
+    # Every feature so far scores a pair in isolation. But each S1 entity has
+    # ~20-40 rival candidates, and a score that looks "good" in isolation can
+    # still be the 3rd-best of 30 rivals sharing common tokens (e.g. a whole
+    # town's "xyz traders"). Ranking each candidate against its OWN S1's other
+    # candidates is what actually drives precision up: it lets the model see
+    # "is this clearly the best match here" rather than just "does this look
+    # similar". A composite of the two strongest lexical signals is used as
+    # the ranking key (comb_tfidf + name_char, both already typo/word-order
+    # tolerant).
+    composite = 0.5 * feats["comb_tfidf_cos"] + 0.5 * feats["name_char_cos"]
+    rank = np.zeros(len(qi), dtype=np.float32)
+    gap_next = np.zeros(len(qi), dtype=np.float32)
+    gap_best = np.zeros(len(qi), dtype=np.float32)
+    n_rivals = np.zeros(len(qi), dtype=np.float32)
+    is_best = np.zeros(len(qi), dtype=np.float32)
+
+    by_q: dict = defaultdict(list)
+    for row, q in enumerate(q_id):
+        by_q[q].append(row)
+    for rows in by_q.values():
+        rows = np.asarray(rows)
+        scores = composite[rows]
+        order = np.argsort(-scores)                  # best first
+        sorted_scores = scores[order]
+        best = sorted_scores[0]
+        n = len(rows)
+        n_rivals[rows] = n - 1
+        for pos, r in enumerate(order):
+            gr = rows[r]
+            rank[gr] = pos                            # 0 = top candidate for this S1
+            gap_best[gr] = best - scores[r]           # 0 for the top candidate itself
+            nxt = sorted_scores[pos + 1] if pos + 1 < n else 0.0
+            gap_next[gr] = scores[r] - nxt            # lead over the very next rival
+            is_best[gr] = 1.0 if pos == 0 else 0.0
+
+    feats["cand_rank"] = rank
+    feats["gap_to_best_rival"] = gap_best
+    feats["gap_to_next_rival"] = gap_next
+    feats["n_rival_candidates"] = n_rivals
+    feats["is_top_candidate"] = is_best
+
+    # Mutual best match: this candidate is S1's #1 choice AND S1 is this
+    # candidate's #1 choice among ITS OWN rivals on the S1 side. A strong,
+    # precision-heavy signal -- two-sided agreement is much less likely to be
+    # a coincidental lexical overlap than a one-sided "looks similar" score.
+    by_t: dict = defaultdict(list)
+    for row, t in enumerate(t_id):
+        by_t[t].append(row)
+    is_best_for_target = np.zeros(len(qi), dtype=np.float32)
+    for rows in by_t.values():
+        rows = np.asarray(rows)
+        scores = composite[rows]
+        best_row = rows[np.argmax(scores)]
+        is_best_for_target[best_row] = 1.0
+    feats["is_top_for_rival_side"] = is_best_for_target
+    feats["is_mutual_best"] = (is_best * is_best_for_target).astype(np.float32)
 
     # Optional cross-encoder reranker score -- strongest precision feature.
     if reranker is not None and reranker.available:
@@ -505,6 +565,17 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
     s1_char_tfidf = char_vec.transform(s1["name"]).tocsr()
     tgt_char_tfidf = char_vec.transform(tgt["name"]).tocsr()
 
+    # Same idea for the ADDRESS (the PS explicitly calls out "Rd vs Road",
+    # missing components, abbreviation variants -- all typo/edit-distance-like
+    # noise that whole-word matching misses but char n-grams tolerate). Used
+    # only as a matcher feature (not a blocking pass -- addresses are noisier
+    # and would blow up candidate volume for little extra recall).
+    achar_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
+                                min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
+    achar_vec.fit(pd.concat([s1["addr"], tgt["addr"]], ignore_index=True))
+    s1_achar_tfidf = achar_vec.transform(s1["addr"]).tocsr()
+    tgt_achar_tfidf = achar_vec.transform(tgt["addr"]).tocsr()
+
     s1_emb = tgt_emb = None
     if args.use_emb:
         log(f"[{split}] embedding {len(s1):,} queries + {len(tgt):,} targets ...")
@@ -551,6 +622,7 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
         s1_name_tfidf=s1_name_tfidf, tgt_name_tfidf=tgt_name_tfidf,
         s1_comb_tfidf=s1_comb_tfidf, tgt_comb_tfidf=tgt_comb_tfidf,
         s1_char_tfidf=s1_char_tfidf, tgt_char_tfidf=tgt_char_tfidf,
+        s1_achar_tfidf=s1_achar_tfidf, tgt_achar_tfidf=tgt_achar_tfidf,
         s1_emb=s1_emb, tgt_emb=tgt_emb,
     )
 
@@ -642,6 +714,7 @@ def train_matcher(train_data: dict, gt: dict[str, set[str]], args):
         train_data["s1_name_tfidf"], train_data["tgt_name_tfidf"],
         train_data["s1_comb_tfidf"], train_data["tgt_comb_tfidf"],
         train_data["s1_char_tfidf"], train_data["tgt_char_tfidf"],
+        train_data["s1_achar_tfidf"], train_data["tgt_achar_tfidf"],
         train_data["s1_emb"], train_data["tgt_emb"],
         reranker, args.use_emb,
     )
@@ -740,6 +813,7 @@ def predict_split(test_data: dict, clf, threshold: float, feature_cols: list[str
         test_data["s1_name_tfidf"], test_data["tgt_name_tfidf"],
         test_data["s1_comb_tfidf"], test_data["tgt_comb_tfidf"],
         test_data["s1_char_tfidf"], test_data["tgt_char_tfidf"],
+        test_data["s1_achar_tfidf"], test_data["tgt_achar_tfidf"],
         test_data["s1_emb"], test_data["tgt_emb"],
         reranker, args.use_emb,
     )

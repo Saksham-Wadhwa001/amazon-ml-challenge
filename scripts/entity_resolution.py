@@ -355,6 +355,7 @@ def build_pairs_and_features(
     comb_vec: TfidfVectorizer,
     s1_name_tfidf, tgt_name_tfidf,
     s1_comb_tfidf, tgt_comb_tfidf,
+    s1_char_tfidf, tgt_char_tfidf,
     s1_emb, tgt_emb,
     reranker: Reranker | None,
     use_emb: bool,
@@ -382,6 +383,7 @@ def build_pairs_and_features(
 
     feats["name_tfidf_cos"] = _row_cos_sparse(s1_name_tfidf[qi], tgt_name_tfidf[ti])
     feats["comb_tfidf_cos"] = _row_cos_sparse(s1_comb_tfidf[qi], tgt_comb_tfidf[ti])
+    feats["name_char_cos"] = _row_cos_sparse(s1_char_tfidf[qi], tgt_char_tfidf[ti])
     if use_emb and s1_emb is not None and tgt_emb is not None:
         feats["emb_cos"] = np.sum(s1_emb[qi] * tgt_emb[ti], axis=1)
 
@@ -480,7 +482,7 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
     # Word-level, df-capped TF-IDF -> sparse & distinctive, so blocking is an
     # inverted-index join (only shared-token records compared). max_df drops
     # ultra-common words (e.g. "road") so posting lists stay short; min_df drops
-    # hapax/typo-unique tokens. char-level typos are handled later by RapidFuzz.
+    # hapax/typo-unique tokens.
     name_vec = TfidfVectorizer(min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
     comb_vec = TfidfVectorizer(min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
     name_vec.fit(pd.concat([s1["name"], tgt["name"]], ignore_index=True))
@@ -490,6 +492,18 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
     tgt_name_tfidf = name_vec.transform(tgt["name"]).tocsr()
     s1_comb_tfidf = comb_vec.transform(s1["combined"]).tocsr()
     tgt_comb_tfidf = comb_vec.transform(tgt["combined"]).tocsr()
+
+    # Character n-gram TF-IDF on the name, purely to raise the BLOCKING RECALL
+    # CEILING. Word-level blocking above requires an exact token match, so a
+    # single typo / OCR-style character difference hides a true match from
+    # every word-level pass -- this was capping recall at 93%. Char n-grams
+    # are typo-tolerant (one edited character still shares most trigrams) and
+    # stay just as scalable: same df cap, same sparse inverted-index join.
+    char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
+                               min_df=args.min_df, max_df=args.max_df, sublinear_tf=True)
+    char_vec.fit(pd.concat([s1["name"], tgt["name"]], ignore_index=True))
+    s1_char_tfidf = char_vec.transform(s1["name"]).tocsr()
+    tgt_char_tfidf = char_vec.transform(tgt["name"]).tocsr()
 
     s1_emb = tgt_emb = None
     if args.use_emb:
@@ -513,7 +527,10 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
     cand_comb = sparse_topk_blocking(s1_ids_a, s1_comb_tfidf, s1_ctry_a,
                                      tgt_ids_a, tgt_comb_tfidf, tgt_ctry_a,
                                      args.k_tfidf, tag=f"{split}:comb")
-    parts = [cand_name, cand_comb, pincode_candidates(s1, tgt)]
+    cand_char = sparse_topk_blocking(s1_ids_a, s1_char_tfidf, s1_ctry_a,
+                                     tgt_ids_a, tgt_char_tfidf, tgt_ctry_a,
+                                     args.k_tfidf, tag=f"{split}:char")
+    parts = [cand_name, cand_comb, cand_char, pincode_candidates(s1, tgt)]
     if args.use_emb:
         # Dense embedding blocking (only viable on GPU / small data); off by
         # default. Uses the memory-bounded blocked_topk.
@@ -530,9 +547,10 @@ def generate_split(processed_dir: Path, split: str, emb_model: EmbeddingModel,
 
     return dict(
         s1=s1, tgt=tgt, candidates=candidates,
-        name_vec=name_vec, comb_vec=comb_vec,
+        name_vec=name_vec, comb_vec=comb_vec, char_vec=char_vec,
         s1_name_tfidf=s1_name_tfidf, tgt_name_tfidf=tgt_name_tfidf,
         s1_comb_tfidf=s1_comb_tfidf, tgt_comb_tfidf=tgt_comb_tfidf,
+        s1_char_tfidf=s1_char_tfidf, tgt_char_tfidf=tgt_char_tfidf,
         s1_emb=s1_emb, tgt_emb=tgt_emb,
     )
 
@@ -586,15 +604,29 @@ def validate_submission(matching: dict[str, list[str]], candidates: dict[str, li
 
 def tune_threshold(prob_by_s1: dict[str, list[tuple[str, float]]],
                    true_map: dict[str, set[str]], val_ids: list[str]) -> tuple[float, float]:
-    """Grid-search the decision threshold that maximises macro-F0.5 on val."""
+    """Grid-search the decision threshold that maximises macro-F0.5 on val.
+
+    F0.5 is precision-heavy, so the optimal cutoff is often high. The grid is
+    coarse at low thresholds and fine near the top (up to 0.995) so the search
+    is never artificially capped by its own boundary (previously the grid
+    stopped at 0.95, and the tuned threshold kept landing exactly on that
+    boundary -- meaning the true optimum was never actually tested).
+    """
+    coarse = np.linspace(0.02, 0.5, 13)
+    fine = np.linspace(0.5, 0.995, 60)
+    grid = np.unique(np.concatenate([coarse, fine]))
+
     best_thr, best_f = 0.5, -1.0
-    for thr in np.linspace(0.05, 0.95, 19):
+    for thr in grid:
         pred_map = {
             s1: {tid for tid, p in prob_by_s1.get(s1, []) if p >= thr} for s1 in val_ids
         }
         f = macro_f_beta(pred_map, true_map, val_ids)
         if f > best_f:
             best_f, best_thr = f, float(thr)
+    if best_thr >= grid[-1] - 1e-9:
+        log(f"  [warn] tuned threshold hit the grid boundary ({best_thr:.3f}); "
+            f"the true optimum may be even higher.")
     return best_thr, best_f
 
 
@@ -609,6 +641,7 @@ def train_matcher(train_data: dict, gt: dict[str, set[str]], args):
         train_data["name_vec"], train_data["comb_vec"],
         train_data["s1_name_tfidf"], train_data["tgt_name_tfidf"],
         train_data["s1_comb_tfidf"], train_data["tgt_comb_tfidf"],
+        train_data["s1_char_tfidf"], train_data["tgt_char_tfidf"],
         train_data["s1_emb"], train_data["tgt_emb"],
         reranker, args.use_emb,
     )
@@ -636,10 +669,16 @@ def train_matcher(train_data: dict, gt: dict[str, set[str]], args):
     val_set = set(train_s1[:n_val])
     is_val = np.array([q in val_set for q in q_id])
 
+    # NOTE: no class_weight="balanced" here. Upweighting the minority (positive)
+    # class biases predicted probabilities toward recall, which then forced the
+    # decision threshold all the way up to compensate -- fighting the metric
+    # instead of matching it. F0.5 is already precision-weighted at the metric
+    # level; leaving probabilities calibrated to the natural class balance and
+    # tuning the threshold (see tune_threshold) is the more direct fix.
     clf = lgb.LGBMClassifier(
         n_estimators=args.n_estimators, learning_rate=args.learning_rate,
         num_leaves=args.num_leaves, subsample=0.8, colsample_bytree=0.8,
-        class_weight="balanced", random_state=args.seed, n_jobs=-1, verbosity=-1,
+        reg_lambda=1.0, random_state=args.seed, n_jobs=-1, verbosity=-1,
     )
     clf.fit(X[~is_val], y[~is_val])
 
@@ -700,6 +739,7 @@ def predict_split(test_data: dict, clf, threshold: float, feature_cols: list[str
         test_data["name_vec"], test_data["comb_vec"],
         test_data["s1_name_tfidf"], test_data["tgt_name_tfidf"],
         test_data["s1_comb_tfidf"], test_data["tgt_comb_tfidf"],
+        test_data["s1_char_tfidf"], test_data["tgt_char_tfidf"],
         test_data["s1_emb"], test_data["tgt_emb"],
         reranker, args.use_emb,
     )
